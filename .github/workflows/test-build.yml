@@ -58,33 +58,27 @@ jobs:
             sub_level: "X"
             os_patch_level: "lts"
 
-          # Android 17 - Kernel 6.18
-          - android_version: "android17"
-            kernel_version: "6.18"
-            sub_level: ""
-            os_patch_level: ""
-            
     name: Build Check - ${{ matrix.kernel_config.android_version }} (Kernel ${{ matrix.kernel_config.kernel_version }})
     
     steps:
-      - name: Maximize build space
-        uses: easimon/maximize-build-space@master
-        with:
-          root-reserve-mb: 6144
-          temp-reserve-mb: 2048
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
-          remove-docker-images: 'true'
+      - name: Clean up build environment
+        run: |
+          # pick from https://github.com/cctv18/oppo_oplus_realme_sm8750/blob/test/.github/workflows/fastbuild_6.6.66.yml
+          sudo apt-mark hold firefox
+          sudo apt-mark hold libc-bin
+          sudo apt purge man-db
+          sudo rm -rf /var/lib/man-db/auto-update
+          # pick from https://github.com/easimon/maximize-build-space/blob/master/action.yml
+          sudo docker image prune --all --force
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
 
       - name: Set CONFIG Environment Variable
         run: |
           # Set CONFIG dynamically based on matrix values
-          CONFIG="${{ matrix.kernel_config.android_version }}-${{ matrix.kernel_config.kernel_version }}"
-          if [ ! -z "${{ matrix.kernel_config.sub_level }}" ]; then
-             CONFIG+="-${{ matrix.kernel_config.sub_level }}"
-          fi
+          CONFIG="${{ matrix.kernel_config.android_version }}-${{ matrix.kernel_config.kernel_version }}-${{ matrix.kernel_config.sub_level }}"
+
           # Set CONFIG as an environment variable for future steps
           echo "CONFIG=$CONFIG" >> $GITHUB_ENV
 
@@ -111,10 +105,7 @@ jobs:
         run: |
           cd "$CONFIG"
           
-          FORMATTED_BRANCH="${{ matrix.kernel_config.android_version }}-${{ matrix.kernel_config.kernel_version }}"
-          if [ ! -z "${{ matrix.kernel_config.os_patch_level }}" ]; then
-           FORMATTED_BRANCH+="-${{ matrix.kernel_config.os_patch_level }}"
-          fi
+          FORMATTED_BRANCH="${{ matrix.kernel_config.android_version }}-${{ matrix.kernel_config.kernel_version }}-${{ matrix.kernel_config.os_patch_level }}"
           
           $REPO init --depth=1 --u https://android.googlesource.com/kernel/manifest -b common-${FORMATTED_BRANCH} --repo-rev=v2.16
           
@@ -148,17 +139,26 @@ jobs:
           printf '\nobj-$(CONFIG_BBG) += baseband-guard/\n' >> "$SECURITY_MAKEFILE" && echo " - Makefile updated"
           # Kconfig source (insert before last endmenu; fallback append)
           grep -q "source \"security/baseband-guard/Kconfig\"" "$SECURITY_KCONFIG" || sed -i "/endmenu/i\source \"security/baseband-guard/Kconfig\"" "$SECURITY_KCONFIG" && echo " - Kconfig updated"
-          sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' $SECURITY_KCONFIG
+          # apply sepatch.txt
+          cp $SELINUX_MAKEFILE ${SELINUX_MAKEFILE}.bak
+          sed -i 's/selinuxfs.o //g' "$SELINUX_MAKEFILE"
+          sed -i 's/hooks.o //g' "$SELINUX_MAKEFILE"
+          cat "$PATCH_FILE" >> "$SELINUX_MAKEFILE"
+          echo "Selinux Makefile patching done!"
+          sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/lockdown/lockdown,baseband_guard/ } }' $SECURITY_KCONFIG
 
       - name: Apply Kernel Configuration
         run: |
           cd "$CONFIG"
           # Remove check_defconfig
           sed -i 's/check_defconfig//' ./common/build.config.gki
+          if [ "${{ matrix.kernel_config.android_version }}-${{ matrix.kernel_config.kernel_version }}" == "android16-6.12" ]; then
+            sed -i '/_X86_GKI_MODULES_LIST = \[/ i\_ARM64_GKI_MODULES_LIST.remove("drivers/android/binder/rust_binder.ko")\n' ./common/modules.bzl
+          fi
 
       # Hey,rust_binder.ko,maybe we need to talk about why you makes build failed
       - name: Append ashmem exports if missing
-        if: matrix.kernel_config.android_version != 'android12' && matrix.kernel_config.android_version != 'android13' && matrix.kernel_config.android_version != 'android14' && matrix.kernel_config.android_version != 'android15'
+        if: startsWith(matrix.kernel_config.android_version, 'android16')
         run: |
           cd "$CONFIG"
           FILE=common/drivers/staging/android/ashmem.c
@@ -187,5 +187,6 @@ jobs:
           if [ -f "build/build.sh" ]; then
             LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh CC="/usr/bin/ccache clang" || exit 1
           else
-            tools/bazel build --disk_cache=/home/runner/.cache/bazel --config=fast //common:kernel_aarch64_dist || exit 1
+            tools/bazel build --disk_cache=/home/runner/.cache/bazel --config=fast --lto=thin //common:kernel_aarch64_dist || exit 1
           fi
+
